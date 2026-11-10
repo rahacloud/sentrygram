@@ -6,7 +6,9 @@
 //	TELEGRAM_CHAT_ID      the chat to post to (required)
 //	RELAY_PATH_TOKEN      the last path segment a webhook must carry
 //	SENTRY_CLIENT_SECRET  the integration's client secret, to check signatures
-//	SENTRY_URL            Sentry's address, for links (https://sentry.io)
+//	SENTRY_URL            Sentry's address, for links and the API (https://sentry.io)
+//	SENTRY_API_TOKEN      an internal integration token (event:read); adds the latest event's details
+//	SENTRY_ORG            the organization slug, when the issue's link does not say it
 //	NOISE_CULPRITS        comma-separated culprit prefixes to drop
 //	ADDR                  listen address (:8080)
 package main
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	"github.com/rahacloud/sentrygram/internal/relay"
+	"github.com/rahacloud/sentrygram/internal/sentry"
 	"github.com/rahacloud/sentrygram/internal/telegram"
 )
 
@@ -56,6 +59,10 @@ func run(logger *slog.Logger) error {
 		Logger:        logger,
 	}
 
+	if apiToken := os.Getenv("SENTRY_API_TOKEN"); apiToken != "" {
+		handler.Events = sentry.New(handler.SentryURL, apiToken, os.Getenv("SENTRY_ORG"))
+	}
+
 	srv := &http.Server{
 		Addr:              cmp.Or(os.Getenv("ADDR"), ":8080"),
 		Handler:           handler,
@@ -70,7 +77,7 @@ func run(logger *slog.Logger) error {
 	errc := make(chan error, 1)
 
 	go func() {
-		logger.Info("listening", "addr", srv.Addr, "path_token", handler.PathToken != "", "signature", handler.ClientSecret != "")
+		logger.Info("listening", "addr", srv.Addr, "path_token", handler.PathToken != "", "signature", handler.ClientSecret != "", "event_details", handler.Events != nil)
 		errc <- srv.ListenAndServe()
 	}()
 

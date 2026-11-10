@@ -156,8 +156,36 @@ func TestReturningIssueAndTelegramFailure(t *testing.T) {
 func TestLinkFallsBackToSentryURL(t *testing.T) {
 	t.Parallel()
 
-	msg := relay.Message(relay.Issue{ID: "7", Title: "x"}, relay.Created, "https://sentry.example/")
+	msg := relay.Message(relay.Issue{ID: "7", Title: "x"}, relay.Created, nil, "https://sentry.example/")
 	if !strings.Contains(msg, `href="https://sentry.example/issues/7/"`) || !strings.Contains(msg, "Open in Sentry →") {
 		t.Fatalf("message: %s", msg)
+	}
+}
+
+type fakeEvents struct {
+	ev  *relay.Event
+	err error
+}
+
+func (f fakeEvents) LatestEvent(context.Context, relay.Issue) (*relay.Event, error) {
+	return f.ev, f.err
+}
+
+func TestEventDetailsAndTheirAbsence(t *testing.T) {
+	t.Parallel()
+
+	s := &fakeSender{}
+	h := newHandler(s)
+	h.Events = fakeEvents{ev: &relay.Event{Environment: "staging"}}
+
+	post(t, h, "/hooks/telegram/secret-token", "issue", created, nil)
+
+	h.Events = fakeEvents{err: errors.New("sentry down")}
+	if code := post(t, h, "/hooks/telegram/secret-token", "issue", created, nil); code != http.StatusOK {
+		t.Fatalf("a failed event read must not stop the message: code = %d", code)
+	}
+
+	if len(s.sent) != 2 || !strings.Contains(s.sent[0], "· staging") || strings.Contains(s.sent[1], "staging") {
+		t.Fatalf("messages: %q", s.sent)
 	}
 }

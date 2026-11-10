@@ -1,0 +1,27 @@
+{
+  "id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+  "platform": "python",
+  "release": {"version": "backend@1.4.2+abc1234", "shortVersion": "1.4.2"},
+  "tags": [
+    {"key": "environment", "value": "production"},
+    {"key": "handled", "value": "no"},
+    {"key": "server_name", "value": "web-1"},
+    {"key": "runtime", "value": "CPython 3.14.0"},
+    {"key": "transaction", "value": "/api/v1/orders/{id}/"}
+  ],
+  "entries": [
+    {"type": "breadcrumbs", "data": {"values": []}},
+    {"type": "exception", "data": {"values": [
+      {"type": "KeyError", "value": "'id'", "mechanism": {"type": "generic", "handled": true},
+       "stacktrace": {"frames": [{"filename": "app/models.py", "function": "load", "lineNo": 3, "inApp": true, "context": [[3, "data['id']"]]}]}},
+      {"type": "ValueError", "value": "order 42 has no total", "mechanism": {"type": "django", "handled": false},
+       "stacktrace": {"frames": [
+         {"filename": "django/core/handlers/base.py", "function": "get_response", "lineNo": 197, "inApp": false, "context": []},
+         {"filename": "app/orders/views.py", "function": "retrieve", "lineNo": 58, "inApp": true,
+          "context": [[57, "    order = self.get_object()"], [58, "    return Response(total(order))"], [59, ""]]},
+         {"filename": "decimal.py", "function": "__new__", "lineNo": 12, "inApp": false, "context": [[12, "raise ValueError"]]}
+       ]}}
+    ]}},
+    {"type": "request", "data": {"method": "GET", "url": "https://api.example.com/api/v1/orders/42/?token=secret"}}
+  ]
+}

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // maxBody bounds a webhook body; Sentry's issue payloads are a few kilobytes.
@@ -21,9 +22,20 @@ type Sender interface {
 	Send(ctx context.Context, text string) error
 }
 
+// EventSource reads an issue's latest event; Sentry's API client is the real one.
+type EventSource interface {
+	LatestEvent(ctx context.Context, issue Issue) (*Event, error)
+}
+
+// eventTimeout bounds the read of an event, so a slow Sentry delays a message
+// by at most this much; the message goes out without the details then.
+const eventTimeout = 5 * time.Second
+
 // Handler answers Sentry's integration webhooks.
 type Handler struct {
 	Sender Sender
+	// Events, when set, adds the latest event's details to each message.
+	Events EventSource
 	// PathToken, when set, must be the last segment of the request path.
 	// Use it when the relay is reachable from the internet.
 	PathToken string
@@ -118,7 +130,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.Sender.Send(r.Context(), Message(issue, hook.Action, h.SentryURL)); err != nil {
+	if err := h.Sender.Send(r.Context(), Message(issue, hook.Action, h.event(r.Context(), issue), h.SentryURL)); err != nil {
 		h.Logger.ErrorContext(r.Context(), "telegram failed", "issue", issue.ShortID, "err", err)
 		w.WriteHeader(http.StatusBadGateway)
 
@@ -127,4 +139,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.Logger.InfoContext(r.Context(), "posted", "action", hook.Action, "issue", issue.ShortID)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) event(ctx context.Context, issue Issue) *Event {
+	if h.Events == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, eventTimeout)
+	defer cancel()
+
+	ev, err := h.Events.LatestEvent(ctx, issue)
+	if err != nil {
+		h.Logger.WarnContext(ctx, "posting without the event's details", "issue", issue.ShortID, "err", err)
+
+		return nil
+	}
+
+	return ev
 }
