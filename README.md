@@ -1,14 +1,56 @@
-# sentrygram
+<div align="center">
+  <h1>sentrygram 🚨</h1>
+  <p><strong>Sentry issue alerts in a Telegram chat, with enough detail to know what broke before you open Sentry.</strong></p>
+  <a href="https://github.com/rahacloud/sentrygram/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/rahacloud/sentrygram/ci.yml?style=for-the-badge&logo=github&label=ci"></a>
+  <a href="https://github.com/rahacloud/sentrygram/actions/workflows/docker.yml"><img alt="Docker" src="https://img.shields.io/github/actions/workflow/status/rahacloud/sentrygram/docker.yml?style=for-the-badge&logo=docker&logoColor=white&label=image"></a>
+  <img alt="Go version" src="https://img.shields.io/github/go-mod/go-version/rahacloud/sentrygram?style=for-the-badge&logo=go">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/rahacloud/sentrygram?style=for-the-badge"></a>
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/rahacloud/sentrygram?style=for-the-badge&logo=git">
+  <a href="https://pkg.go.dev/github.com/rahacloud/sentrygram"><img alt="Go Reference" src="https://img.shields.io/badge/go.dev-reference-007d9c?style=for-the-badge&logo=go&logoColor=white"></a>
+  <img alt="Code size" src="https://img.shields.io/github/languages/code-size/rahacloud/sentrygram?style=for-the-badge">
+  <br>
+  <img alt="Sentry" src="https://img.shields.io/badge/Sentry-integration-362D59?style=for-the-badge&logo=sentry&logoColor=white">
+  <img alt="Telegram" src="https://img.shields.io/badge/Telegram-Bot%20API-26A5E4?style=for-the-badge&logo=telegram&logoColor=white">
+  <br>
+  <img alt="GHCR image size" src="https://ghcr-badge.egpl.dev/rahacloud/sentrygram/size?color=%232496ED&tag=main&label=image+size">
+</div>
 
-[![ci](https://github.com/rahacloud/sentrygram/actions/workflows/ci.yml/badge.svg)](https://github.com/rahacloud/sentrygram/actions/workflows/ci.yml)
-[![docker](https://github.com/rahacloud/sentrygram/actions/workflows/docker.yml/badge.svg)](https://github.com/rahacloud/sentrygram/actions/workflows/docker.yml)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-
-Sentry issue alerts in a Telegram chat, with enough detail to know what broke before you open Sentry.
-
-sentrygram is a small HTTP service that receives the webhooks of a Sentry [internal integration](https://docs.sentry.io/organization/integrations/integration-platform/internal-integration/) and posts one message per **new issue** and per **issue that comes back** (a regression or a reopen). Every other event (each new error, assignments, resolves, Seer) is answered and dropped, so a bad deploy that throws ten thousand errors is one message per issue, not ten thousand.
+**sentrygram** is a small HTTP service that receives the webhooks of a Sentry [internal integration](https://docs.sentry.io/organization/integrations/integration-platform/internal-integration/) and posts one Telegram message per **new issue** and per **issue that comes back** (a regression or a reopen). Every other event (each new error, assignments, resolves, Seer) is answered and dropped, so a bad deploy that throws ten thousand errors is one message per issue, not ten thousand.
 
 It is one static Go binary with no dependencies outside the standard library, shipped as a distroless image: `ghcr.io/rahacloud/sentrygram`.
+
+> *sentrygram* = **Sentry** + Tele**gram**. That is all it does.
+
+## Table of contents
+
+- [Features](#features)
+- [How it works](#how-it-works)
+- [What a message looks like](#what-a-message-looks-like)
+- [Quick start](#quick-start)
+- [Setting it up](#setting-it-up)
+- [Configuration](#configuration)
+- [Behaviour worth knowing](#behaviour-worth-knowing)
+- [Self-hosted Sentry](#self-hosted-sentry)
+- [Development](#development)
+- [License](#license)
+
+## Features
+
+- 🎯 **One message per issue, not per error.** Only `created` and `unresolved` issue webhooks are posted; a flood of events is one alert.
+- 🔍 **Context without a click.** With an API token it reads the issue's latest event and adds the environment, release, the in-app line of code that raised, the request, server and runtime.
+- 🔐 **Locked down.** A secret path token, optional `Sentry-Hook-Signature` (HMAC-SHA256) checks, and the bot token never reaches a log line.
+- 🧹 **Noise filter.** Drop issues by culprit prefix, such as a Django management shell.
+- 🛟 **Degrades gracefully.** If Sentry's API is slow or down, the message still goes out, without the extra details.
+- 🪶 **Tiny.** Standard library only, one static binary, a distroless non-root image, a `GET` health check on any path.
+
+## How it works
+
+```mermaid
+flowchart LR
+    S[Sentry<br>internal integration] -- "issue webhook<br>/hooks/telegram/TOKEN" --> R[sentrygram]
+    R -- "latest event<br>(optional, event:read)" --> A[Sentry API]
+    R -- "sendMessage (HTML)" --> T[Telegram chat]
+```
 
 ## What a message looks like
 
