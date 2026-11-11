@@ -228,11 +228,13 @@ func facts(issue Issue, event *Event) []string {
 
 	add(issue.Platform)
 
+	// The event's mechanism is the more precise answer; the issue's flag fills in
+	// when there is no event or it does not say.
 	switch {
-	case event != nil && event.Handled != nil && !*event.Handled, event == nil && issue.IsUnhandled:
-		add("🔥 unhandled")
-	case event != nil && event.Handled != nil:
+	case event != nil && event.Handled != nil && *event.Handled:
 		add("handled")
+	case event != nil && event.Handled != nil, issue.IsUnhandled:
+		add("🔥 unhandled")
 	}
 
 	if issue.Priority != "" {

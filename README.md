@@ -40,6 +40,7 @@ It is one static Go binary with no dependencies outside the standard library, sh
 - 🔍 **Context without a click.** With an API token it reads the issue's latest event and adds the environment, release, the in-app line of code that raised, the request, server and runtime.
 - 🔐 **Locked down.** A secret path token, optional `Sentry-Hook-Signature` (HMAC-SHA256) checks, and the bot token never reaches a log line.
 - 🧹 **Noise filter.** Drop issues by culprit prefix, such as a Django management shell.
+- ⚡ **Answers Sentry at once.** Sentry waits only one second for a webhook and retries one that took longer, so sentrygram answers first and delivers in the background, with its own retries.
 - 🛟 **Degrades gracefully.** If Sentry's API is slow or down, the message still goes out, without the extra details.
 - 🪶 **Tiny.** Standard library only, one static binary, a distroless non-root image, a `GET` health check on any path.
 
@@ -120,7 +121,7 @@ with sentry_sdk.new_scope() as scope:
 sentry_sdk.flush()
 ```
 
-sentrygram logs one JSON line per decision (`posted`, `dropped noise`, `refused an unauthorized request`, `posting without the event's details`, `telegram failed`), so `docker logs sentrygram` tells you what happened to each webhook.
+sentrygram logs one JSON line per decision (`posted`, `dropped noise`, `refused an unauthorized request`, `posting without the event's details`, `telegram failed, retrying`, `telegram failed, message lost`), so `docker logs sentrygram` tells you what happened to each webhook.
 
 ## Configuration
 
@@ -140,8 +141,11 @@ Everything is an environment variable.
 
 ## Behaviour worth knowing
 
-- **What is posted:** webhooks with `Sentry-Hook-Resource: issue` and action `created` or `unresolved`. Everything else gets a 200 and no message.
-- **Failures:** if Telegram refuses the message or cannot be reached, sentrygram answers 502, so Sentry records the delivery as failed. If reading the event from Sentry fails or takes more than 5 seconds, the message goes out without the event's details rather than not at all.
+- **What is posted:** webhooks with `Sentry-Hook-Resource: issue` and action `created` or `unresolved`. These get a 202 as soon as they are checked, and the message is sent in the background. Everything else gets a 200 and no message.
+- **Why it answers first:** Sentry gives a webhook one second (`sentry-apps.webhook.timeout.sec`), retries a timeout three times five minutes apart, and counts timeouts toward disabling the integration. Reading the event and calling Telegram can take longer than that, so neither happens while Sentry waits.
+- **Failures:** a message that Telegram cannot take is tried 4 times, 2, 4 and 8 seconds apart, or after the `retry_after` Telegram asks for when it rate-limits. A permanent refusal (a wrong chat, a bot that is not a member) is not retried. Every failure is logged (`telegram failed, retrying`, and `telegram failed, message lost` when it gives up). If reading the event from Sentry fails or takes more than 5 seconds, the message goes out without the event's details rather than not at all.
+- **Shutdown:** on `SIGTERM` sentrygram stops taking webhooks and waits up to 25 seconds for the messages it has already accepted.
+- **No authentication is a warning:** with neither `RELAY_PATH_TOKEN` nor `SENTRY_CLIENT_SECRET` set, anyone who can reach the address can post to the chat, and sentrygram says so at startup.
 - **Secrets:** the bot token never reaches a log line; an error that would carry it has it replaced by `<token>`. Request URLs lose their query strings before they are posted.
 - **Formatting:** messages use Telegram's HTML mode and everything that comes from Sentry is escaped. Long titles, culprits and lines of code are clipped.
 
@@ -197,7 +201,7 @@ just image    # docker build
 
 The code is three packages. `internal/relay` decides what is posted and writes the message, with no I/O. `internal/sentry` reads an issue's latest event from Sentry's API. `internal/telegram` sends to the Bot API. `cmd/sentrygram` wires them together from the environment. The tests use synthetic payloads in `internal/sentry/testdata/`; never commit a real event, which carries URLs, file paths and user data.
 
-CI lints and tests every push and pull request. Every push to `main` and every `v*` tag publishes an image tagged with the branch or version and with `sha-<commit>`.
+CI lints and tests every push and pull request. Every push to `main` and every `v*` tag publishes a `linux/amd64` + `linux/arm64` image tagged with the branch or version and with `sha-<commit>`.
 
 ## License
 

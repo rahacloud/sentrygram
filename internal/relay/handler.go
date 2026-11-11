@@ -1,16 +1,19 @@
 package relay
 
 import (
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +21,10 @@ import (
 const maxBody = 1 << 20
 
 // Sender delivers one message; the Telegram client is the real one.
+//
+// An error with a Temporary() bool method that reports false is not retried,
+// and one with a RetryAfter() time.Duration method sets the wait before the
+// next attempt.
 type Sender interface {
 	Send(ctx context.Context, text string) error
 }
@@ -27,11 +34,22 @@ type EventSource interface {
 	LatestEvent(ctx context.Context, issue Issue) (*Event, error)
 }
 
-// eventTimeout bounds the read of an event, so a slow Sentry delays a message
-// by at most this much; the message goes out without the details then.
-const eventTimeout = 5 * time.Second
+const (
+	// eventTimeout bounds the read of an event, so a slow Sentry delays a message
+	// by at most this much; the message goes out without the details then.
+	eventTimeout = 5 * time.Second
+	// deliverTimeout bounds everything one message may take, retries included.
+	deliverTimeout = 2 * time.Minute
+	// defaultAttempts and defaultRetryDelay apply when the Handler leaves them zero.
+	defaultAttempts   = 4
+	defaultRetryDelay = 2 * time.Second
+)
 
 // Handler answers Sentry's integration webhooks.
+//
+// Sentry waits only one second for an answer and retries a request that took
+// longer, so the handler answers as soon as a webhook is checked and delivers
+// the message in the background, retrying Telegram itself.
 type Handler struct {
 	Sender Sender
 	// Events, when set, adds the latest event's details to each message.
@@ -45,7 +63,13 @@ type Handler struct {
 	SentryURL string
 	// NoiseCulprits drops issues whose culprit starts with one of these.
 	NoiseCulprits []string
-	Logger        *slog.Logger
+	// Attempts is how many times a message is sent before it is given up; 4 when zero.
+	Attempts int
+	// RetryDelay is the wait before the first retry, doubled after each; 2s when zero.
+	RetryDelay time.Duration
+	Logger     *slog.Logger
+
+	inflight sync.WaitGroup
 }
 
 type webhook struct {
@@ -77,8 +101,9 @@ func (h *Handler) authorized(r *http.Request, body []byte) bool {
 	return true
 }
 
-// ServeHTTP answers GET with 200 (a health check) and posts issue webhooks.
-// Sentry retries on 5xx, so only a failed delivery to Telegram answers 502.
+// ServeHTTP answers GET with 200 (a health check). An issue webhook that is
+// posted gets 202 and its message is delivered in the background; one that is
+// dropped gets 200.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
@@ -130,15 +155,79 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.Sender.Send(r.Context(), Message(issue, hook.Action, h.event(r.Context(), issue), h.SentryURL)); err != nil {
-		h.Logger.ErrorContext(r.Context(), "telegram failed", "issue", issue.ShortID, "err", err)
-		w.WriteHeader(http.StatusBadGateway)
+	// The request's context ends when Sentry hangs up; the delivery must outlive it.
+	ctx := context.WithoutCancel(r.Context())
 
-		return
+	h.inflight.Go(func() { h.deliver(ctx, hook.Action, issue) })
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// Drain waits for the messages still being delivered, or until ctx ends.
+// Call it after the server has stopped taking requests.
+func (h *Handler) Drain(ctx context.Context) error {
+	done := make(chan struct{})
+
+	go func() {
+		h.inflight.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
 
-	h.Logger.InfoContext(r.Context(), "posted", "action", hook.Action, "issue", issue.ShortID)
-	w.WriteHeader(http.StatusOK)
+type temporary interface{ Temporary() bool }
+
+type retryAfter interface{ RetryAfter() time.Duration }
+
+func (h *Handler) deliver(ctx context.Context, action Action, issue Issue) {
+	ctx, cancel := context.WithTimeout(ctx, deliverTimeout)
+	defer cancel()
+
+	text := Message(issue, action, h.event(ctx, issue), h.SentryURL)
+	attempts := cmp.Or(h.Attempts, defaultAttempts)
+	delay := cmp.Or(h.RetryDelay, defaultRetryDelay)
+
+	for attempt := 1; ; attempt++ {
+		err := h.Sender.Send(ctx, text)
+		if err == nil {
+			h.Logger.InfoContext(ctx, "posted", "action", action, "issue", issue.ShortID, "attempt", attempt)
+
+			return
+		}
+
+		var t temporary
+		if attempt >= attempts || (errors.As(err, &t) && !t.Temporary()) {
+			h.Logger.ErrorContext(ctx, "telegram failed, message lost", "issue", issue.ShortID, "attempts", attempt, "err", err)
+
+			return
+		}
+
+		wait := delay
+
+		var ra retryAfter
+		if errors.As(err, &ra) && ra.RetryAfter() > wait {
+			wait = ra.RetryAfter()
+		}
+
+		h.Logger.WarnContext(ctx, "telegram failed, retrying", "issue", issue.ShortID, "attempt", attempt, "wait", wait, "err", err)
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			h.Logger.ErrorContext(ctx, "telegram failed, message lost", "issue", issue.ShortID, "attempts", attempt, "err", ctx.Err())
+
+			return
+		case <-timer.C:
+		}
+
+		delay *= 2
+	}
 }
 
 func (h *Handler) event(ctx context.Context, issue Issue) *Event {

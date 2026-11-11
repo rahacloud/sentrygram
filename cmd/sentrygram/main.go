@@ -17,6 +17,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -59,6 +60,10 @@ func run(logger *slog.Logger) error {
 		Logger:        logger,
 	}
 
+	if handler.PathToken == "" && handler.ClientSecret == "" {
+		logger.Warn("neither RELAY_PATH_TOKEN nor SENTRY_CLIENT_SECRET is set: anyone who can reach this address can post to the chat")
+	}
+
 	if apiToken := os.Getenv("SENTRY_API_TOKEN"); apiToken != "" {
 		handler.Events = sentry.New(handler.SentryURL, apiToken, os.Getenv("SENTRY_ORG"))
 	}
@@ -87,8 +92,18 @@ func run(logger *slog.Logger) error {
 	case <-ctx.Done():
 	}
 
-	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Stop taking webhooks, then let the messages already accepted go out.
+	// 25 s fits in the default 30 s grace of Docker and Kubernetes.
+	shutdown, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	return srv.Shutdown(shutdown)
+	if err := srv.Shutdown(shutdown); err != nil {
+		return err
+	}
+
+	if err := handler.Drain(shutdown); err != nil {
+		return fmt.Errorf("stopped with messages still undelivered: %w", err)
+	}
+
+	return nil
 }

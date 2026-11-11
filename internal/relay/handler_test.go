@@ -11,21 +11,48 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/rahacloud/sentrygram/internal/relay"
 )
 
+// fakeSender records every attempt and fails the first len(errs) of them.
 type fakeSender struct {
+	mu   sync.Mutex
 	sent []string
-	err  error
+	errs []error
 }
 
 func (f *fakeSender) Send(_ context.Context, text string) error {
-	f.sent = append(f.sent, text)
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-	return f.err
+	f.sent = append(f.sent, text)
+	if n := len(f.sent); n <= len(f.errs) {
+		return f.errs[n-1]
+	}
+
+	return nil
 }
+
+func (f *fakeSender) messages() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.sent...)
+}
+
+type permanent struct{}
+
+func (permanent) Error() string   { return "chat not found" }
+func (permanent) Temporary() bool { return false }
+
+type limited struct{}
+
+func (limited) Error() string             { return "too many requests" }
+func (limited) RetryAfter() time.Duration { return 20 * time.Millisecond }
 
 const created = `{"action":"created","data":{"issue":{"id":"283","shortId":"GOOGLE-INTEGRATION-6","title":"boom",
 "culprit":"apps.views in get","level":"error","web_url":"https://sentry.example/issues/283/",
@@ -37,6 +64,7 @@ func newHandler(s *fakeSender) *relay.Handler {
 		PathToken:     "secret-token",
 		SentryURL:     "https://sentry.example",
 		NoiseCulprits: []string{"django.core.management.commands.shell"},
+		RetryDelay:    time.Millisecond,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
@@ -57,21 +85,38 @@ func post(t *testing.T, h http.Handler, path, resource, body string, header map[
 	return rec.Code
 }
 
+// drain waits for the background deliveries, as the server does on shutdown.
+func drain(t *testing.T, h *relay.Handler) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+}
+
 func TestPostsCreatedIssue(t *testing.T) {
 	t.Parallel()
 
 	s := &fakeSender{}
-	if code := post(t, newHandler(s), "/hooks/telegram/secret-token", "issue", created, nil); code != http.StatusOK {
+	h := newHandler(s)
+
+	if code := post(t, h, "/hooks/telegram/secret-token", "issue", created, nil); code != http.StatusAccepted {
 		t.Fatalf("code = %d", code)
 	}
 
-	if len(s.sent) != 1 {
-		t.Fatalf("sent %d messages", len(s.sent))
+	drain(t, h)
+
+	sent := s.messages()
+	if len(sent) != 1 {
+		t.Fatalf("sent %d messages", len(sent))
 	}
 
 	for _, want := range []string{"🚨 <b>ERROR</b> · <b>google-integration</b>", "ValueError: a &lt; b", "apps.views in get", `href="https://sentry.example/issues/283/"`, "GOOGLE-INTEGRATION-6 →"} {
-		if !strings.Contains(s.sent[0], want) {
-			t.Errorf("message lacks %q:\n%s", want, s.sent[0])
+		if !strings.Contains(sent[0], want) {
+			t.Errorf("message lacks %q:\n%s", want, sent[0])
 		}
 	}
 }
@@ -80,11 +125,15 @@ func TestRefusesWrongPath(t *testing.T) {
 	t.Parallel()
 
 	s := &fakeSender{}
-	if code := post(t, newHandler(s), "/hooks/telegram/nope", "issue", created, nil); code != http.StatusNotFound {
+	h := newHandler(s)
+
+	if code := post(t, h, "/hooks/telegram/nope", "issue", created, nil); code != http.StatusNotFound {
 		t.Fatalf("code = %d", code)
 	}
 
-	if len(s.sent) != 0 {
+	drain(t, h)
+
+	if len(s.messages()) != 0 {
 		t.Fatal("posted without the token")
 	}
 }
@@ -104,12 +153,14 @@ func TestChecksSignature(t *testing.T) {
 	mac.Write([]byte(created))
 
 	sig := hex.EncodeToString(mac.Sum(nil))
-	if code := post(t, h, "/x/secret-token", "issue", created, map[string]string{"Sentry-Hook-Signature": sig}); code != http.StatusOK {
+	if code := post(t, h, "/x/secret-token", "issue", created, map[string]string{"Sentry-Hook-Signature": sig}); code != http.StatusAccepted {
 		t.Fatalf("good signature: code = %d", code)
 	}
 
-	if len(s.sent) != 1 {
-		t.Fatalf("sent %d messages", len(s.sent))
+	drain(t, h)
+
+	if n := len(s.messages()); n != 1 {
+		t.Fatalf("sent %d messages", n)
 	}
 }
 
@@ -133,23 +184,91 @@ func TestDropsOtherEventsAndNoise(t *testing.T) {
 		}
 	}
 
-	if len(s.sent) != 0 {
-		t.Fatalf("posted %d messages, want none", len(s.sent))
+	drain(t, h)
+
+	if n := len(s.messages()); n != 0 {
+		t.Fatalf("posted %d messages, want none", n)
 	}
 }
 
-func TestReturningIssueAndTelegramFailure(t *testing.T) {
+func TestReturningIssue(t *testing.T) {
 	t.Parallel()
 
-	s := &fakeSender{err: errors.New("down")}
+	s := &fakeSender{}
+	h := newHandler(s)
 	back := strings.Replace(created, `"created"`, `"unresolved"`, 1)
 
-	if code := post(t, newHandler(s), "/hooks/telegram/secret-token", "issue", back, nil); code != http.StatusBadGateway {
+	if code := post(t, h, "/hooks/telegram/secret-token", "issue", back, nil); code != http.StatusAccepted {
 		t.Fatalf("code = %d", code)
 	}
 
-	if len(s.sent) != 1 || !strings.Contains(s.sent[0], "🔁") || !strings.Contains(s.sent[0], "back again") {
-		t.Fatalf("message: %v", s.sent)
+	drain(t, h)
+
+	if sent := s.messages(); len(sent) != 1 || !strings.Contains(sent[0], "🔁") || !strings.Contains(sent[0], "back again") {
+		t.Fatalf("message: %v", sent)
+	}
+}
+
+func TestAnswersBeforeTelegram(t *testing.T) {
+	t.Parallel()
+
+	// Sentry gives a webhook one second; a slow Telegram must not hold the answer.
+	release := make(chan struct{})
+	s := &blockingSender{release: release}
+	h := newHandler(&fakeSender{})
+	h.Sender = s
+
+	start := time.Now()
+	if code := post(t, h, "/hooks/telegram/secret-token", "issue", created, nil); code != http.StatusAccepted {
+		t.Fatalf("code = %d", code)
+	}
+
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Fatalf("answered after %s", took)
+	}
+
+	close(release)
+	drain(t, h)
+}
+
+type blockingSender struct{ release chan struct{} }
+
+func (b *blockingSender) Send(ctx context.Context, _ string) error {
+	select {
+	case <-b.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestRetries(t *testing.T) {
+	t.Parallel()
+
+	for name, c := range map[string]struct {
+		errs     []error
+		attempts int
+	}{
+		"recovers":           {errs: []error{errors.New("down"), limited{}}, attempts: 3},
+		"gives up":           {errs: []error{errors.New("down"), errors.New("down"), errors.New("down"), errors.New("down"), errors.New("down")}, attempts: 4},
+		"permanent refusals": {errs: []error{permanent{}}, attempts: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			s := &fakeSender{errs: c.errs}
+			h := newHandler(s)
+
+			if code := post(t, h, "/hooks/telegram/secret-token", "issue", created, nil); code != http.StatusAccepted {
+				t.Fatalf("code = %d", code)
+			}
+
+			drain(t, h)
+
+			if n := len(s.messages()); n != c.attempts {
+				t.Fatalf("attempts = %d, want %d", n, c.attempts)
+			}
+		})
 	}
 }
 
@@ -179,13 +298,39 @@ func TestEventDetailsAndTheirAbsence(t *testing.T) {
 	h.Events = fakeEvents{ev: &relay.Event{Environment: "staging"}}
 
 	post(t, h, "/hooks/telegram/secret-token", "issue", created, nil)
+	drain(t, h)
 
 	h.Events = fakeEvents{err: errors.New("sentry down")}
-	if code := post(t, h, "/hooks/telegram/secret-token", "issue", created, nil); code != http.StatusOK {
+	if code := post(t, h, "/hooks/telegram/secret-token", "issue", created, nil); code != http.StatusAccepted {
 		t.Fatalf("a failed event read must not stop the message: code = %d", code)
 	}
 
-	if len(s.sent) != 2 || !strings.Contains(s.sent[0], "· staging") || strings.Contains(s.sent[1], "staging") {
-		t.Fatalf("messages: %q", s.sent)
+	drain(t, h)
+
+	if sent := s.messages(); len(sent) != 2 || !strings.Contains(sent[0], "· staging") || strings.Contains(sent[1], "staging") {
+		t.Fatalf("messages: %q", sent)
+	}
+}
+
+func TestHandledFlag(t *testing.T) {
+	t.Parallel()
+
+	yes, no := true, false
+	unhandled := relay.Issue{ID: "1", Title: "x", IsUnhandled: true}
+
+	for name, c := range map[string]struct {
+		issue relay.Issue
+		event *relay.Event
+		want  string
+	}{
+		"no event":               {unhandled, nil, "🔥 unhandled"},
+		"event without the flag": {unhandled, &relay.Event{}, "🔥 unhandled"},
+		"event says unhandled":   {relay.Issue{ID: "1"}, &relay.Event{Handled: &no}, "🔥 unhandled"},
+		"event says handled":     {unhandled, &relay.Event{Handled: &yes}, "handled"},
+	} {
+		msg := relay.Message(c.issue, relay.Created, c.event, "https://sentry.example")
+		if !strings.Contains(msg, c.want) || (c.want == "handled" && strings.Contains(msg, "unhandled")) {
+			t.Errorf("%s: message lacks %q:\n%s", name, c.want, msg)
+		}
 	}
 }
