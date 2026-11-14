@@ -32,6 +32,7 @@ It is one static Go binary with no dependencies outside the standard library, sh
 - [Behaviour worth knowing](#behaviour-worth-knowing)
 - [Self-hosted Sentry](#self-hosted-sentry)
 - [Development](#development)
+- [Who is behind sentrygram](#who-is-behind-sentrygram)
 - [License](#license)
 
 ## Features
@@ -202,6 +203,10 @@ just image    # docker build
 The code is three packages. `internal/relay` decides what is posted and writes the message, with no I/O. `internal/sentry` reads an issue's latest event from Sentry's API. `internal/telegram` sends to the Bot API. `cmd/sentrygram` wires them together from the environment. The tests use synthetic payloads in `internal/sentry/testdata/`; never commit a real event, which carries URLs, file paths and user data.
 
 CI lints and tests every push and pull request. Every push to `main` and every `v*` tag publishes a `linux/amd64` + `linux/arm64` image tagged with the branch or version and with `sha-<commit>`.
+
+## Who is behind sentrygram
+
+`sentrygram` is built and maintained by [Raha Cloud](https://rahacloud.com/en), an infrastructure and DevOps consulting team. We run it in production for Hatchup Capital, where it relays Sentry issues to the team's Telegram chat. If you would rather have someone set up and operate your Sentry, monitoring or deployments for you, [get in touch](https://rahacloud.com/en#contact).
 
 ## License
 
